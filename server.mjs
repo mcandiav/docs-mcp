@@ -104,7 +104,260 @@ async function walkFiles(dir, baseDir, options, results = []) {
   return results;
 }
 
+async function copyRecursive(src, dest) {
+  const st = await fs.stat(src);
+  if (st.isDirectory()) {
+    await fs.mkdir(dest, { recursive: true });
+    const entries = await fs.readdir(src, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcChild = path.join(src, entry.name);
+      const destChild = path.join(dest, entry.name);
+      await copyRecursive(srcChild, destChild);
+    }
+    return;
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  await fs.copyFile(src, dest);
+}
+
+async function walkTree(dir, baseDir, options, results = [], depth = 0) {
+  const { includeHidden = true, maxResults = 20_000, maxDepth = 10, exclude = [".git", "node_modules"] } = options ?? {};
+  if (depth > maxDepth || results.length >= maxResults) return results;
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (results.length >= maxResults) break;
+    if (!includeHidden && entry.name.startsWith(".")) continue;
+    if (exclude.includes(entry.name)) continue;
+
+    const fullPath = path.join(dir, entry.name);
+    const relativePath = toPosixRelative(path.relative(baseDir, fullPath));
+    results.push({ relative_path: relativePath, type: entry.isDirectory() ? "dir" : "file" });
+
+    if (entry.isDirectory()) {
+      await walkTree(fullPath, baseDir, options, results, depth + 1);
+    }
+  }
+
+  return results;
+}
+
 function registerTools(server) {
+  server.registerTool(
+    "copy_path",
+    {
+      title: "Copiar archivo o carpeta",
+      description: "Copia un archivo o carpeta dentro del workspace permitido.",
+      inputSchema: {
+        from_relative_path: z.string().min(1),
+        to_relative_path: z.string().min(1),
+        recursive: z.boolean().optional().default(false),
+        overwrite: z.boolean().optional().default(false)
+      },
+      outputSchema: {
+        from_relative_path: z.string(),
+        to_relative_path: z.string(),
+        copied: z.boolean()
+      }
+    },
+    async ({ from_relative_path, to_relative_path, recursive, overwrite }) => {
+      const srcPath = resolveSafePath(from_relative_path);
+      const destPath = resolveSafePath(to_relative_path);
+      const srcStat = await fs.stat(srcPath);
+      const destStat = await fs.stat(destPath).catch(() => null);
+
+      if (destStat && !overwrite) {
+        throw new Error("El destino ya existe. Usa overwrite=true para reemplazar.");
+      }
+
+      if (destStat && overwrite) {
+        await fs.rm(destPath, { recursive: true, force: true });
+      }
+
+      if (srcStat.isDirectory()) {
+        if (!recursive) throw new Error("El origen es un directorio. Usa recursive=true para copiarlo.");
+        await copyRecursive(srcPath, destPath);
+      } else {
+        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        await fs.copyFile(srcPath, destPath);
+      }
+
+      return {
+        content: [{ type: "text", text: `Copiado: ${from_relative_path} -> ${to_relative_path}` }],
+        structuredContent: { from_relative_path, to_relative_path, copied: true }
+      };
+    }
+  );
+
+  server.registerTool(
+    "move_path",
+    {
+      title: "Mover o renombrar path",
+      description: "Mueve o renombra un archivo/carpeta dentro del workspace permitido.",
+      inputSchema: {
+        from_relative_path: z.string().min(1),
+        to_relative_path: z.string().min(1),
+        overwrite: z.boolean().optional().default(false)
+      },
+      outputSchema: {
+        from_relative_path: z.string(),
+        to_relative_path: z.string(),
+        moved: z.boolean()
+      }
+    },
+    async ({ from_relative_path, to_relative_path, overwrite }) => {
+      const srcPath = resolveSafePath(from_relative_path);
+      const destPath = resolveSafePath(to_relative_path);
+      const destStat = await fs.stat(destPath).catch(() => null);
+
+      if (destStat && !overwrite) {
+        throw new Error("El destino ya existe. Usa overwrite=true para reemplazar.");
+      }
+      if (destStat && overwrite) {
+        await fs.rm(destPath, { recursive: true, force: true });
+      }
+
+      await fs.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.rename(srcPath, destPath);
+
+      return {
+        content: [{ type: "text", text: `Movido: ${from_relative_path} -> ${to_relative_path}` }],
+        structuredContent: { from_relative_path, to_relative_path, moved: true }
+      };
+    }
+  );
+
+  server.registerTool(
+    "patch_file",
+    {
+      title: "Parchear archivo de texto",
+      description: "Aplica un reemplazo textual parcial dentro de un archivo UTF-8.",
+      inputSchema: {
+        relative_path: z.string().min(1),
+        old_text: z.string(),
+        new_text: z.string(),
+        all_occurrences: z.boolean().optional().default(false)
+      },
+      outputSchema: {
+        relative_path: z.string(),
+        replaced: z.number(),
+        bytes_written: z.number()
+      }
+    },
+    async ({ relative_path, old_text, new_text, all_occurrences }) => {
+      const fullPath = resolveSafePath(relative_path);
+      const buf = await fs.readFile(fullPath);
+      if (!isProbablyText(buf)) {
+        throw new Error("El archivo parece binario. patch_file solo admite texto.");
+      }
+
+      const txt = buf.toString("utf8");
+      if (!old_text) throw new Error("old_text no puede estar vacio.");
+
+      let replaced = 0;
+      let updated = txt;
+      if (all_occurrences) {
+        replaced = txt.split(old_text).length - 1;
+        updated = txt.split(old_text).join(new_text);
+      } else if (txt.includes(old_text)) {
+        replaced = 1;
+        updated = txt.replace(old_text, new_text);
+      }
+
+      if (replaced > 0) {
+        await fs.writeFile(fullPath, Buffer.from(updated, "utf8"));
+      }
+
+      return {
+        content: [{ type: "text", text: `patch_file: ${replaced} reemplazo(s) en ${relative_path}` }],
+        structuredContent: {
+          relative_path,
+          replaced,
+          bytes_written: Buffer.byteLength(updated, "utf8")
+        }
+      };
+    }
+  );
+
+  server.registerTool(
+    "get_tree",
+    {
+      title: "Arbol de directorio",
+      description: "Lista el arbol (archivos y carpetas) de un directorio dentro del workspace.",
+      inputSchema: {
+        relative_dir: z.string().optional().default("."),
+        include_hidden: z.boolean().optional().default(true),
+        max_depth: z.number().int().min(0).max(50).optional().default(10),
+        max_results: z.number().int().min(1).max(100_000).optional().default(20_000)
+      },
+      outputSchema: {
+        root: z.string(),
+        entries: z.array(
+          z.object({
+            relative_path: z.string(),
+            type: z.enum(["file", "dir"])
+          })
+        )
+      }
+    },
+    async ({ relative_dir, include_hidden, max_depth, max_results }) => {
+      const dirPath = resolveSafePath(relative_dir, { allowWorkspaceRoot: true });
+      const st = await fs.stat(dirPath);
+      if (!st.isDirectory()) throw new Error("relative_dir debe ser un directorio.");
+
+      const entries = await walkTree(dirPath, WORKSPACE_ROOT, {
+        includeHidden: include_hidden,
+        maxDepth: max_depth,
+        maxResults: max_results
+      });
+
+      return {
+        content: [{ type: "text", text: entries.length ? entries.map((e) => `${e.type}\t${e.relative_path}`).join("\n") : "(sin resultados)" }],
+        structuredContent: {
+          root: toPosixRelative(path.relative(WORKSPACE_ROOT, dirPath) || "."),
+          entries
+        }
+      };
+    }
+  );
+
+  server.registerTool(
+    "git_diff",
+    {
+      title: "Diff Git",
+      description: "Devuelve diff de Git (working tree o staged) del workspace.",
+      inputSchema: {
+        relative_path: z.string().optional(),
+        staged: z.boolean().optional().default(false)
+      },
+      outputSchema: {
+        staged: z.boolean(),
+        relative_path: z.string().optional(),
+        diff: z.string()
+      }
+    },
+    async ({ relative_path, staged }) => {
+      const args = ["diff"];
+      if (staged) args.push("--staged");
+      if (relative_path) {
+        resolveSafePath(relative_path);
+        args.push("--", relative_path);
+      }
+
+      const { stdout } = await execFileAsync("git", args, { cwd: WORKSPACE_ROOT, maxBuffer: 10 * 1024 * 1024 });
+      const diff = stdout || "";
+
+      return {
+        content: [{ type: "text", text: diff || "(sin cambios)" }],
+        structuredContent: {
+          staged,
+          relative_path,
+          diff
+        }
+      };
+    }
+  );
+
   server.registerTool(
     "list_files",
     {

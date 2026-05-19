@@ -662,13 +662,35 @@ if (typeof cfAccessJwt === "string" && cfAccessJwt.trim()) {
 }
 ```
 
-### 21.3 Rebuild
+### 21.3 Validar que todas las tools tengan `outputSchema`
+
+```powershell
+cd D:\mcp\docs-mcp; Select-String -Path server.mjs -Pattern "registerTool|outputSchema" -Context 0,8
+```
+
+Cada bloque `server.registerTool(...)` debe declarar:
+
+```js
+outputSchema: {
+  // estructura esperada de structuredContent
+}
+```
+
+La validación debe confirmar que no aparezca en ChatGPT la advertencia:
+
+```text
+ESQUEMA DE SALIDA RECOMENDADO
+```
+
+Si esa advertencia aparece en una tool, esa tool debe considerarse incompleta y se debe agregar su `outputSchema` en `server.mjs`.
+
+### 21.4 Rebuild
 
 ```powershell
 cd D:\mcp\docs-mcp; docker compose up -d --build --force-recreate
 ```
 
-### 21.4 Ver contenedor
+### 21.5 Ver contenedor
 
 ```powershell
 docker ps --filter "name=docs-mcp"
@@ -683,7 +705,7 @@ docs-mcp
 
 o el puerto configurado en el ambiente.
 
-### 21.5 Ver logs
+### 21.6 Ver logs
 
 ```powershell
 docker logs docs-mcp --tail 200
@@ -696,7 +718,7 @@ docs-mcp listening on http://0.0.0.0:8787
 MCP endpoint available at http://0.0.0.0:8787/mcp
 ```
 
-### 21.6 Probar endpoint local sin token
+### 21.7 Probar endpoint local sin token
 
 ```powershell
 Invoke-WebRequest -Uri http://127.0.0.1:8787/mcp -Method GET
@@ -710,7 +732,7 @@ Respuesta esperada en OAuth:
 
 Esto es correcto: el MCP está vivo y exige token.
 
-### 21.7 Probar endpoint público sin token
+### 21.8 Probar endpoint público sin token
 
 ```powershell
 try { Invoke-WebRequest -Uri "https://docs.at-once.cl/mcp" -Method GET -UseBasicParsing } catch { $_.Exception.Response.Headers["WWW-Authenticate"] }
@@ -718,7 +740,7 @@ try { Invoke-WebRequest -Uri "https://docs.at-once.cl/mcp" -Method GET -UseBasic
 
 Debe devolver un header `WWW-Authenticate` de tipo Bearer/OAuth.
 
-### 21.8 Probar Authorization Server
+### 21.9 Probar Authorization Server
 
 ```powershell
 (Invoke-WebRequest -Uri "https://at-once.cloudflareaccess.com/.well-known/oauth-authorization-server" -Method GET -UseBasicParsing).Content
@@ -732,7 +754,7 @@ Debe incluir:
 
 Esto confirma soporte de Dynamic Client Registration.
 
-### 21.9 Probar metadata local del MCP
+### 21.10 Probar metadata local del MCP
 
 ```powershell
 (Invoke-WebRequest -Uri "http://127.0.0.1:8787/.well-known/oauth-protected-resource" -Method GET -UseBasicParsing).Content
@@ -763,6 +785,9 @@ El entregable se acepta solo si cumple todo esto:
 - [ ] `OAUTH_REQUIRED_SCOPES` vacío no bloquea acceso.
 - [ ] `.env.example` explica Cloudflare Access.
 - [ ] `docker-compose.yml` contiene `env_file: - .env`.
+- [ ] Todas las tools registradas con `server.registerTool(...)` declaran `outputSchema`.
+- [ ] Cada `outputSchema` coincide con el `structuredContent` que retorna la tool.
+- [ ] En ChatGPT no aparece la advertencia `ESQUEMA DE SALIDA RECOMENDADO` en ninguna tool.
 - [ ] Docker se reconstruyó después del cambio.
 - [ ] ChatGPT llega hasta Cloudflare `Allow`.
 - [ ] Después del `Allow`, ChatGPT puede listar tools MCP.
@@ -780,8 +805,11 @@ El entregable debe rechazarse si ocurre cualquiera de estos casos:
 4. `MCP_PUBLIC_URL` no termina en `/mcp`.
 5. `OAUTH_AUDIENCE` no corresponde al AUD Tag de la aplicación Cloudflare Access correcta.
 6. `docker-compose.yml` no carga `.env`.
-7. Se modificó código o configuración pero no se reconstruyó el contenedor.
-8. ChatGPT llega a `Allow` pero el MCP sigue respondiendo `Missing Bearer token`.
+7. Alguna tool no declara `outputSchema`.
+8. Algún `outputSchema` no coincide con el `structuredContent` real retornado por la tool.
+9. ChatGPT muestra `ESQUEMA DE SALIDA RECOMENDADO` en una o más tools.
+10. Se modificó código o configuración pero no se reconstruyó el contenedor.
+11. ChatGPT llega a `Allow` pero el MCP sigue respondiendo `Missing Bearer token`.
 
 ---
 
@@ -795,10 +823,301 @@ El servidor debe exponer al menos estas tools:
 | `read_file` | Lee el contenido de un archivo dentro del workspace. |
 | `write_file` | Crea o reemplaza un archivo dentro del workspace. |
 | `delete_path` | Borra un archivo o carpeta dentro del workspace. |
+| `copy_path` | Copia un archivo o carpeta dentro del workspace. |
+| `move_path` | Mueve o renombra un archivo o carpeta dentro del workspace. |
+| `patch_file` | Aplica reemplazo parcial de texto en un archivo. |
 | `make_dir` | Crea un directorio dentro del workspace. |
+| `get_tree` | Lista arbol de archivos y carpetas. |
 | `stat_path` | Devuelve metadata de archivo o carpeta. |
 | `search_files` | Busca archivos por nombre o contenido. |
+| `git_diff` | Devuelve diff de Git (working tree o staged). |
 | `git_status` | Muestra el estado Git del workspace. |
+
+Cada tool debe declarar explícitamente:
+
+1. `inputSchema`, para definir los argumentos aceptados.
+2. `outputSchema`, para definir la forma del `structuredContent` retornado.
+
+La ausencia de `outputSchema` no necesariamente impide que la tool se ejecute, pero ChatGPT la marcará con la advertencia:
+
+```text
+ESQUEMA DE SALIDA RECOMENDADO
+```
+
+Esa advertencia debe tratarse como deuda técnica del entregable. El programa se considera incompleto hasta que todas las tools declaren `outputSchema` coherente con su salida real.
+
+### 24.1 `outputSchema` esperado por tool
+
+#### `list_files`
+
+```js
+outputSchema: {
+  files: z.array(z.string())
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  files
+}
+```
+
+#### `read_file`
+
+```js
+outputSchema: {
+  relative_path: z.string(),
+  encoding: z.enum(["utf8", "base64"]),
+  bytes: z.number(),
+  content: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  relative_path,
+  encoding: resolvedEncoding,
+  bytes: data.byteLength,
+  content
+}
+```
+
+#### `write_file`
+
+```js
+outputSchema: {
+  relative_path: z.string(),
+  encoding: z.enum(["utf8", "base64"]),
+  bytes_written: z.number()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  relative_path,
+  encoding,
+  bytes_written: buf.byteLength
+}
+```
+
+#### `delete_path`
+
+```js
+outputSchema: {
+  relative_path: z.string(),
+  deleted: z.boolean(),
+  reason: z.string().optional()
+}
+```
+
+Debe corresponder a las salidas:
+
+```js
+structuredContent: {
+  relative_path,
+  deleted: false,
+  reason: "not_found"
+}
+```
+
+```js
+structuredContent: {
+  relative_path,
+  deleted: true
+}
+```
+
+#### `copy_path`
+
+```js
+outputSchema: {
+  from_relative_path: z.string(),
+  to_relative_path: z.string(),
+  copied: z.boolean()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  from_relative_path,
+  to_relative_path,
+  copied: true
+}
+```
+
+#### `move_path`
+
+```js
+outputSchema: {
+  from_relative_path: z.string(),
+  to_relative_path: z.string(),
+  moved: z.boolean()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  from_relative_path,
+  to_relative_path,
+  moved: true
+}
+```
+
+#### `patch_file`
+
+```js
+outputSchema: {
+  relative_path: z.string(),
+  replaced: z.number(),
+  bytes_written: z.number()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  relative_path,
+  replaced,
+  bytes_written: Buffer.byteLength(updated, "utf8")
+}
+```
+
+#### `make_dir`
+
+```js
+outputSchema: {
+  relative_dir: z.string(),
+  created: z.boolean()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  relative_dir,
+  created: true
+}
+```
+
+#### `get_tree`
+
+```js
+outputSchema: {
+  root: z.string(),
+  entries: z.array(
+    z.object({
+      relative_path: z.string(),
+      type: z.enum(["file", "dir"])
+    })
+  )
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  root: toPosixRelative(path.relative(WORKSPACE_ROOT, dirPath) || "."),
+  entries
+}
+```
+
+#### `stat_path`
+
+```js
+outputSchema: {
+  relative_path: z.string(),
+  is_file: z.boolean(),
+  is_dir: z.boolean(),
+  size: z.number(),
+  mtime: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  relative_path,
+  is_file: st.isFile(),
+  is_dir: st.isDirectory(),
+  size: st.size,
+  mtime: st.mtime.toISOString()
+}
+```
+
+#### `search_files`
+
+```js
+outputSchema: {
+  query: z.string(),
+  results: z.array(
+    z.object({
+      relative_path: z.string(),
+      preview: z.string().optional()
+    })
+  )
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  query,
+  results: hits
+}
+```
+
+#### `git_status`
+
+```js
+outputSchema: {
+  branch: z.string(),
+  status: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  branch: branch.trim(),
+  status: shortStatus.trim()
+}
+```
+
+#### `git_diff`
+
+```js
+outputSchema: {
+  staged: z.boolean(),
+  relative_path: z.string().optional(),
+  diff: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  staged,
+  relative_path,
+  diff
+}
+```
 
 ---
 
@@ -864,9 +1183,10 @@ La configuración se considera correcta cuando:
 4. Cloudflare Access muestra `Authorize Client` para ChatGPT.
 5. Después de `Allow`, ChatGPT conecta.
 6. ChatGPT muestra las tools MCP.
-7. ChatGPT puede ejecutar `list_files`.
-8. ChatGPT puede ejecutar `write_file`.
-9. No aparece `Missing Bearer token` después de una autorización Cloudflare exitosa.
+7. ChatGPT no muestra `ESQUEMA DE SALIDA RECOMENDADO` en ninguna tool.
+8. ChatGPT puede ejecutar `list_files`.
+9. ChatGPT puede ejecutar `write_file`.
+10. No aparece `Missing Bearer token` después de una autorización Cloudflare exitosa.
 
 ---
 
@@ -892,6 +1212,14 @@ Cloudflare puede autorizar correctamente, pero docs-mcp rechaza la conexión des
 
 La solución es modificar `getBearerToken(req)`, configurar `.env` del entorno y reconstruir el contenedor.
 
+Además, todas las tools MCP deben declarar `outputSchema`:
+
+```text
+Cada server.registerTool(...) debe tener inputSchema y outputSchema.
+```
+
+Si ChatGPT muestra `ESQUEMA DE SALIDA RECOMENDADO`, la tool está incompleta para esta documentación y debe corregirse en `server.mjs`.
+
 ---
 
 ## 30. Comandos útiles
@@ -914,6 +1242,12 @@ Verificar `Cf-Access-Jwt-Assertion` en código:
 
 ```powershell
 cd D:\mcp\docs-mcp; Select-String -Path server.mjs -Pattern "cf-access-jwt-assertion|getBearerToken" -Context 0,12
+```
+
+Verificar `outputSchema` en las tools:
+
+```powershell
+cd D:\mcp\docs-mcp; Select-String -Path server.mjs -Pattern "registerTool|outputSchema" -Context 0,8
 ```
 
 Recrear contenedor:
@@ -958,6 +1292,6 @@ Probar Authorization Server:
 
 Este README es la fuente de verdad técnica.
 
-Toda corrección futura de arquitectura, seguridad, OAuth, Docker, EasyPanel o Cloudflare debe incorporarse aquí.
+Toda corrección futura de arquitectura, seguridad, OAuth, Docker, EasyPanel, Cloudflare o definición de tools MCP debe incorporarse aquí.
 
 Si existe contradicción entre README y código, se debe corregir el código o actualizar formalmente esta documentación antes de entregar.
