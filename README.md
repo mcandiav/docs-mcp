@@ -240,6 +240,10 @@ OAUTH_ISSUER=https://at-once.cloudflareaccess.com
 OAUTH_AUDIENCE=ba86613db7f94862d55ca39c2de3d5fb36d50ea19328c3d06d30feda562c34be
 OAUTH_JWKS_URL=https://at-once.cloudflareaccess.com/cdn-cgi/access/certs
 OAUTH_REQUIRED_SCOPES=
+
+# Git write tools are disabled by default.
+MCP_GIT_WRITE_ENABLED=false
+MCP_GIT_PUSH_ENABLED=false
 ```
 
 Notas:
@@ -832,6 +836,9 @@ El servidor debe exponer al menos estas tools:
 | `search_files` | Busca archivos por nombre o contenido. |
 | `git_diff` | Devuelve diff de Git (working tree o staged). |
 | `git_status` | Muestra el estado Git del workspace. |
+| `git_add` | Agrega rutas permitidas al indice Git. |
+| `git_commit` | Crea un commit Git con el mensaje indicado. |
+| `git_push` | Publica la rama actual o indicada al remoto configurado, solo si esta habilitado por variable de entorno. |
 
 Cada tool debe declarar explícitamente:
 
@@ -1116,6 +1123,68 @@ structuredContent: {
   staged,
   relative_path,
   diff
+}
+```
+
+#### `git_add`
+
+```js
+outputSchema: {
+  paths: z.array(z.string()),
+  status: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  paths: safePaths,
+  status: status.trim()
+}
+```
+
+#### `git_commit`
+
+```js
+outputSchema: {
+  committed: z.boolean(),
+  stdout: z.string(),
+  stderr: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  committed: true,
+  stdout: result.stdout,
+  stderr: result.stderr
+}
+```
+
+#### `git_push`
+
+```js
+outputSchema: {
+  pushed: z.boolean(),
+  remote: z.string(),
+  branch: z.string(),
+  stdout: z.string(),
+  stderr: z.string()
+}
+```
+
+Debe corresponder a:
+
+```js
+structuredContent: {
+  pushed: true,
+  remote: selectedRemote,
+  branch: selectedBranch,
+  stdout: result.stdout,
+  stderr: result.stderr
 }
 ```
 

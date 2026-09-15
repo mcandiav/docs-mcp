@@ -8,3 +8,14 @@ yarn-error.log*
 pnpm-debug.log*
 .DS_Store
 Thumbs.db
+dist/
+build/
+.venv/
+venv/
+__pycache__/
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
