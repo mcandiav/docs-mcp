@@ -159,25 +159,6 @@ async function walkTree(dir, baseDir, options, results = [], depth = 0) {
   return results;
 }
 
-function assertGitWriteEnabled() {
-  if (!GIT_WRITE_ENABLED) {
-    throw new Error("Git write disabled. Define MCP_GIT_WRITE_ENABLED=true para habilitar git_add y git_commit.");
-  }
-}
-
-function assertGitPushEnabled() {
-  if (!GIT_WRITE_ENABLED || !GIT_PUSH_ENABLED) {
-    throw new Error("Git push disabled. Define MCP_GIT_WRITE_ENABLED=true y MCP_GIT_PUSH_ENABLED=true para habilitar git_push.");
-  }
-}
-
-function normalizeGitPaths(paths) {
-  if (!Array.isArray(paths) || paths.length === 0) {
-    throw new Error("paths debe contener al menos una ruta relativa.");
-  }
-  return paths.map((p) => normalizeRelativePath(p, { allowWorkspaceRoot: true }));
-}
-
 function registerTools(server) {
   server.registerTool(
     "copy_path",
@@ -868,105 +849,6 @@ function registerTools(server) {
           relative_dir: ctx.relativeDir,
           repo_root: ctx.repoRoot,
           model: ctx.model
-        }
-      };
-    }
-  );
-
-  server.registerTool(
-    "git_add",
-    {
-      title: "Git add",
-      description: "Agrega archivos al indice Git del workspace permitido.",
-      inputSchema: {
-        paths: z.array(z.string().min(1)).min(1)
-      },
-      outputSchema: {
-        paths: z.array(z.string()),
-        status: z.string()
-      }
-    },
-    async ({ paths }) => {
-      assertGitWriteEnabled();
-      const safePaths = normalizeGitPaths(paths);
-      await execFileAsync("git", ["add", "--", ...safePaths], { cwd: WORKSPACE_ROOT });
-      const { stdout: status } = await execFileAsync("git", ["status", "--short"], { cwd: WORKSPACE_ROOT });
-
-      return {
-        content: [{ type: "text", text: status.trim() || "(working tree limpio)" }],
-        structuredContent: { paths: safePaths, status: status.trim() }
-      };
-    }
-  );
-
-  server.registerTool(
-    "git_commit",
-    {
-      title: "Git commit",
-      description: "Crea un commit Git en el workspace permitido.",
-      inputSchema: {
-        message: z.string().min(1).max(500)
-      },
-      outputSchema: {
-        committed: z.boolean(),
-        stdout: z.string(),
-        stderr: z.string()
-      }
-    },
-    async ({ message }) => {
-      assertGitWriteEnabled();
-      const result = await execFileAsync("git", ["commit", "-m", message], {
-        cwd: WORKSPACE_ROOT,
-        maxBuffer: 10 * 1024 * 1024
-      });
-
-      return {
-        content: [{ type: "text", text: [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || "Commit creado." }],
-        structuredContent: {
-          committed: true,
-          stdout: result.stdout,
-          stderr: result.stderr
-        }
-      };
-    }
-  );
-
-  server.registerTool(
-    "git_push",
-    {
-      title: "Git push",
-      description: "Publica commits al remoto Git configurado del workspace permitido.",
-      inputSchema: {
-        remote: z.string().optional().default("origin"),
-        branch: z.string().optional()
-      },
-      outputSchema: {
-        pushed: z.boolean(),
-        remote: z.string(),
-        branch: z.string(),
-        stdout: z.string(),
-        stderr: z.string()
-      }
-    },
-    async ({ remote, branch }) => {
-      assertGitPushEnabled();
-      const selectedRemote = remote?.trim() || "origin";
-      const selectedBranch = branch?.trim() || (await execFileAsync("git", ["branch", "--show-current"], { cwd: WORKSPACE_ROOT })).stdout.trim();
-      if (!selectedBranch) throw new Error("No se pudo resolver la rama actual para git_push.");
-
-      const result = await execFileAsync("git", ["push", selectedRemote, selectedBranch], {
-        cwd: WORKSPACE_ROOT,
-        maxBuffer: 10 * 1024 * 1024
-      });
-
-      return {
-        content: [{ type: "text", text: [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || "Push completado." }],
-        structuredContent: {
-          pushed: true,
-          remote: selectedRemote,
-          branch: selectedBranch,
-          stdout: result.stdout,
-          stderr: result.stderr
         }
       };
     }
