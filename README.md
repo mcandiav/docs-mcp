@@ -1091,102 +1091,101 @@ structuredContent: {
 #### `git_status`
 
 ```js
+inputSchema: {
+  relative_dir: z.string().optional().default(".")
+}
 outputSchema: {
   branch: z.string(),
-  status: z.string()
+  status: z.string(),
+  relative_dir: z.string(),
+  repo_root: z.string(),
+  model: z.enum(["independent", "shared"])
 }
 ```
 
-Debe corresponder a:
-
-```js
-structuredContent: {
-  branch: branch.trim(),
-  status: shortStatus.trim()
-}
-```
+`relative_dir` se interpreta respecto de `MCP_WORKSPACE_ROOT`. Si se omite, el comportamiento permanece compatible con la raiz del workspace.
 
 #### `git_diff`
 
 ```js
+inputSchema: {
+  relative_dir: z.string().optional().default("."),
+  relative_path: z.string().optional(),
+  staged: z.boolean().optional().default(false)
+}
 outputSchema: {
   staged: z.boolean(),
   relative_path: z.string().optional(),
+  relative_dir: z.string(),
+  repo_root: z.string(),
+  model: z.enum(["independent", "shared"]),
+  branch: z.string(),
   diff: z.string()
 }
 ```
 
-Debe corresponder a:
-
-```js
-structuredContent: {
-  staged,
-  relative_path,
-  diff
-}
-```
+`relative_path` es relativo a `relative_dir`. El diff se limita al alcance autorizado del proyecto.
 
 #### `git_add`
 
 ```js
+inputSchema: {
+  relative_dir: z.string().optional().default("."),
+  paths: z.array(z.string().min(1)).min(1)
+}
 outputSchema: {
   paths: z.array(z.string()),
-  status: z.string()
+  status: z.string(),
+  relative_dir: z.string(),
+  repo_root: z.string(),
+  model: z.enum(["independent", "shared"]),
+  branch: z.string()
 }
 ```
 
-Debe corresponder a:
-
-```js
-structuredContent: {
-  paths: safePaths,
-  status: status.trim()
-}
-```
+Las rutas de `paths` son relativas a `relative_dir`. No se permiten adds globales que contaminen otros proyectos.
 
 #### `git_commit`
 
 ```js
+inputSchema: {
+  relative_dir: z.string().optional().default("."),
+  message: z.string().min(1).max(500)
+}
 outputSchema: {
   committed: z.boolean(),
   stdout: z.string(),
-  stderr: z.string()
+  stderr: z.string(),
+  relative_dir: z.string(),
+  repo_root: z.string(),
+  model: z.enum(["independent", "shared"]),
+  branch: z.string()
 }
 ```
 
-Debe corresponder a:
-
-```js
-structuredContent: {
-  committed: true,
-  stdout: result.stdout,
-  stderr: result.stderr
-}
-```
+Solo confirma cambios ya preparados dentro del alcance. Preserva el indice ajeno. No usa `git commit -- <paths>` para incorporar cambios no preparados.
 
 #### `git_push`
 
 ```js
+inputSchema: {
+  relative_dir: z.string().optional().default("."),
+  remote: z.string().optional().default("origin"),
+  branch: z.string().optional()
+}
 outputSchema: {
   pushed: z.boolean(),
   remote: z.string(),
   branch: z.string(),
   stdout: z.string(),
-  stderr: z.string()
+  stderr: z.string(),
+  relative_dir: z.string(),
+  repo_root: z.string(),
+  model: z.enum(["independent", "shared"])
 }
 ```
 
-Debe corresponder a:
-
-```js
-structuredContent: {
-  pushed: true,
-  remote: selectedRemote,
-  branch: selectedBranch,
-  stdout: result.stdout,
-  stderr: result.stderr
-}
-```
+Resuelve el repositorio automaticamente. En repositorios compartidos rechaza push si los commits pendientes incluyen rutas ajenas al alcance. No hace force push ni cambia de rama automaticamente.
 
 ---
 
@@ -1364,3 +1363,53 @@ Este README es la fuente de verdad técnica.
 Toda corrección futura de arquitectura, seguridad, OAuth, Docker, EasyPanel, Cloudflare o definición de tools MCP debe incorporarse aquí.
 
 Si existe contradicción entre README y código, se debe corregir el código o actualizar formalmente esta documentación antes de entregar.
+
+---
+
+## 32. Git multiproyecto (`relative_dir`)
+
+Las cinco tools Git aceptan `relative_dir` opcional (default `"."`) interpretado respecto de `MCP_WORKSPACE_ROOT`.
+
+### 32.1 Modelos detectados automaticamente
+
+| Modelo | Condicion | Comportamiento |
+|---|---|---|
+| `independent` | El directorio seleccionado es la raiz de su propio repo Git | Status/diff/add/commit/push operan sobre ese repo completo |
+| `shared` | El directorio es un subdirectorio de un repo Git mayor | Las operaciones se limitan al prefijo de ese subdirectorio |
+
+No se crean repositorios nuevos ni se altera la estructura existente.
+
+### 32.2 Casos de uso
+
+```text
+# Repo independiente
+git_status({ relative_dir: "Booking" })
+git_add({ relative_dir: "Booking", paths: ["README.md"] })
+git_commit({ relative_dir: "Booking", message: "docs: update booking" })
+git_push({ relative_dir: "Booking" })
+
+# Subdirectorio de monorepo compartido
+git_status({ relative_dir: "shared/proj-a" })
+git_diff({ relative_dir: "shared/proj-a", relative_path: "a.txt", staged: false })
+```
+
+### 32.3 Restricciones
+
+- `paths` de `git_add` son relativos a `relative_dir`.
+- `relative_path` de `git_diff` es relativo a `relative_dir`.
+- `git_commit` no usa commit-por-rutas que incorpore cambios no preparados; preserva el indice ajeno.
+- `git_push` en modelo `shared` rechaza si los commits pendientes incluyen rutas fuera del alcance.
+- No hay force push ni cambio automatico de rama.
+- Traversal, rutas absolutas y escapes por symlink se rechazan.
+- Siguen vigentes `MCP_GIT_WRITE_ENABLED` y `MCP_GIT_PUSH_ENABLED`.
+- Implementacion en `git-context.mjs` + tools en `server.mjs`; sin shell arbitrario.
+
+### 32.4 Diferencias local vs GitHub (al momento de esta instruccion)
+
+| Elemento | GitHub `origin/main` (`2f20e3c`) | Working tree local (sin publicar) |
+|---|---|---|
+| Tools Git write/push | Presentes, solo sobre `WORKSPACE_ROOT` | Presentes + `relative_dir` multiproyecto |
+| Resolvedor Git | No | `git-context.mjs` (deteccion independent/shared, locks, aislamiento) |
+| Commit local `967efbf` | No esta en GitHub | Conservado en historial local (docs/gitignore/Faltantes) |
+| Historial | `2f20e3c` | Local ahead/behind respecto de origin; merge formal pendiente de revision |
+| Contenedor productivo | No reconstruido en esta fase | Sin rebuild / sin push |

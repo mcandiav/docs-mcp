@@ -1,15 +1,12 @@
 import express from "express";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
-
-const execFileAsync = promisify(execFile);
+import { createGitContextResolver, withGitLock } from "./git-context.mjs";
 
 const app = express();
 app.use(express.json({ limit: process.env.MCP_HTTP_JSON_LIMIT ?? "25mb" }));
@@ -22,6 +19,8 @@ const MAX_INLINE_BYTES = Number(process.env.MCP_MAX_INLINE_BYTES ?? 1_000_000);
 const AUTH_MODE = (process.env.MCP_AUTH_MODE ?? "none").trim().toLowerCase();
 const MCP_API_KEY = process.env.MCP_API_KEY?.trim() || process.env.MCP_AUTH_TOKEN?.trim() || "";
 const NORMALIZED_API_KEY = normalizeToken(MCP_API_KEY);
+const GIT_WRITE_ENABLED = String(process.env.MCP_GIT_WRITE_ENABLED ?? "false").trim().toLowerCase() === "true";
+const GIT_PUSH_ENABLED = String(process.env.MCP_GIT_PUSH_ENABLED ?? "false").trim().toLowerCase() === "true";
 const OAUTH_ISSUER = process.env.OAUTH_ISSUER?.trim() || "";
 const OAUTH_AUDIENCE = process.env.OAUTH_AUDIENCE?.trim() || "";
 const OAUTH_JWKS_URL = process.env.OAUTH_JWKS_URL?.trim() || "";
@@ -70,6 +69,24 @@ function resolveSafePath(relativePath, options = {}) {
   }
 
   return fullPath;
+}
+
+const git = createGitContextResolver({
+  workspaceRoot: WORKSPACE_ROOT,
+  normalizeRelativePath,
+  resolveSafePath
+});
+
+function assertGitWriteEnabled() {
+  if (!GIT_WRITE_ENABLED) {
+    throw new Error("Git write disabled. Define MCP_GIT_WRITE_ENABLED=true para habilitar git_add y git_commit.");
+  }
+}
+
+function assertGitPushEnabled() {
+  if (!GIT_WRITE_ENABLED || !GIT_PUSH_ENABLED) {
+    throw new Error("Git push disabled. Define MCP_GIT_WRITE_ENABLED=true y MCP_GIT_PUSH_ENABLED=true para habilitar git_push.");
+  }
 }
 
 function toPosixRelative(p) {
@@ -325,33 +342,35 @@ function registerTools(server) {
     "git_diff",
     {
       title: "Diff Git",
-      description: "Devuelve diff de Git (working tree o staged) del workspace.",
+      description: "Devuelve diff de Git (working tree o staged) del proyecto seleccionado.",
       inputSchema: {
+        relative_dir: z.string().optional().default("."),
         relative_path: z.string().optional(),
         staged: z.boolean().optional().default(false)
       },
       outputSchema: {
         staged: z.boolean(),
         relative_path: z.string().optional(),
+        relative_dir: z.string(),
+        repo_root: z.string(),
+        model: z.enum(["independent", "shared"]),
+        branch: z.string(),
         diff: z.string()
       }
     },
-    async ({ relative_path, staged }) => {
-      const args = ["diff"];
-      if (staged) args.push("--staged");
-      if (relative_path) {
-        resolveSafePath(relative_path);
-        args.push("--", relative_path);
-      }
-
-      const { stdout } = await execFileAsync("git", args, { cwd: WORKSPACE_ROOT, maxBuffer: 10 * 1024 * 1024 });
-      const diff = stdout || "";
+    async ({ relative_dir, relative_path, staged }) => {
+      const ctx = await git.resolveGitContext(relative_dir);
+      const diff = await withGitLock(ctx.lockKey, () => git.listDiff(ctx, { relativePath: relative_path, staged }));
 
       return {
         content: [{ type: "text", text: diff || "(sin cambios)" }],
         structuredContent: {
           staged,
           relative_path,
+          relative_dir: ctx.relativeDir,
+          repo_root: ctx.repoRoot,
+          model: ctx.model,
+          branch: ctx.branch,
           diff
         }
       };
@@ -663,22 +682,29 @@ function registerTools(server) {
     "git_status",
     {
       title: "Estado Git",
-      description: "Muestra el estado Git del workspace de prueba.",
-      inputSchema: {},
+      description: "Muestra el estado Git del proyecto seleccionado dentro del workspace.",
+      inputSchema: {
+        relative_dir: z.string().optional().default(".")
+      },
       outputSchema: {
         branch: z.string(),
-        status: z.string()
+        status: z.string(),
+        relative_dir: z.string(),
+        repo_root: z.string(),
+        model: z.enum(["independent", "shared"])
       }
     },
-    async () => {
-      const { stdout: shortStatus } = await execFileAsync("git", ["status", "--short"], {
-        cwd: WORKSPACE_ROOT
-      });
-      const { stdout: branch } = await execFileAsync("git", ["branch", "--show-current"], {
-        cwd: WORKSPACE_ROOT
-      });
-
-      const statusText = [`branch: ${branch.trim() || "(sin rama)"}`, "", shortStatus.trim() || "(working tree limpio)"].join("\n");
+    async ({ relative_dir }) => {
+      const ctx = await git.resolveGitContext(relative_dir);
+      const shortStatus = await withGitLock(ctx.lockKey, () => git.listStatus(ctx));
+      const statusText = [
+        `relative_dir: ${ctx.relativeDir}`,
+        `repo_root: ${ctx.repoRoot}`,
+        `model: ${ctx.model}`,
+        `branch: ${ctx.branch || "(sin rama)"}`,
+        "",
+        shortStatus || "(working tree limpio)"
+      ].join("\n");
 
       return {
         content: [
@@ -688,8 +714,141 @@ function registerTools(server) {
           }
         ],
         structuredContent: {
-          branch: branch.trim(),
-          status: shortStatus.trim()
+          branch: ctx.branch,
+          status: shortStatus,
+          relative_dir: ctx.relativeDir,
+          repo_root: ctx.repoRoot,
+          model: ctx.model
+        }
+      };
+    }
+  );
+
+  server.registerTool(
+    "git_add",
+    {
+      title: "Git add",
+      description: "Agrega archivos al indice Git dentro del proyecto seleccionado.",
+      inputSchema: {
+        relative_dir: z.string().optional().default("."),
+        paths: z.array(z.string().min(1)).min(1)
+      },
+      outputSchema: {
+        paths: z.array(z.string()),
+        status: z.string(),
+        relative_dir: z.string(),
+        repo_root: z.string(),
+        model: z.enum(["independent", "shared"]),
+        branch: z.string()
+      }
+    },
+    async ({ relative_dir, paths }) => {
+      assertGitWriteEnabled();
+      const ctx = await git.resolveGitContext(relative_dir);
+      const result = await withGitLock(ctx.lockKey, () => git.gitAdd(ctx, paths));
+
+      return {
+        content: [{ type: "text", text: result.status || "(working tree limpio)" }],
+        structuredContent: {
+          paths: result.paths,
+          status: result.status,
+          relative_dir: ctx.relativeDir,
+          repo_root: ctx.repoRoot,
+          model: ctx.model,
+          branch: ctx.branch
+        }
+      };
+    }
+  );
+
+  server.registerTool(
+    "git_commit",
+    {
+      title: "Git commit",
+      description: "Crea un commit Git limitado a los cambios preparados del proyecto seleccionado.",
+      inputSchema: {
+        relative_dir: z.string().optional().default("."),
+        message: z.string().min(1).max(500)
+      },
+      outputSchema: {
+        committed: z.boolean(),
+        stdout: z.string(),
+        stderr: z.string(),
+        relative_dir: z.string(),
+        repo_root: z.string(),
+        model: z.enum(["independent", "shared"]),
+        branch: z.string()
+      }
+    },
+    async ({ relative_dir, message }) => {
+      assertGitWriteEnabled();
+      const ctx = await git.resolveGitContext(relative_dir);
+      const result = await withGitLock(ctx.lockKey, () => git.gitCommitScoped(ctx, message));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || "Commit creado."
+          }
+        ],
+        structuredContent: {
+          committed: true,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          relative_dir: ctx.relativeDir,
+          repo_root: ctx.repoRoot,
+          model: ctx.model,
+          branch: ctx.branch
+        }
+      };
+    }
+  );
+
+  server.registerTool(
+    "git_push",
+    {
+      title: "Git push",
+      description: "Publica commits del repositorio correspondiente al proyecto seleccionado, rechazando cambios ajenos al alcance.",
+      inputSchema: {
+        relative_dir: z.string().optional().default("."),
+        remote: z.string().optional().default("origin"),
+        branch: z.string().optional()
+      },
+      outputSchema: {
+        pushed: z.boolean(),
+        remote: z.string(),
+        branch: z.string(),
+        stdout: z.string(),
+        stderr: z.string(),
+        relative_dir: z.string(),
+        repo_root: z.string(),
+        model: z.enum(["independent", "shared"])
+      }
+    },
+    async ({ relative_dir, remote, branch }) => {
+      assertGitPushEnabled();
+      const ctx = await git.resolveGitContext(relative_dir);
+      const result = await withGitLock(ctx.lockKey, () =>
+        git.gitPushScoped(ctx, { remote: remote?.trim() || "origin", branch })
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || "Push completado."
+          }
+        ],
+        structuredContent: {
+          pushed: true,
+          remote: result.remote,
+          branch: result.branch,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          relative_dir: ctx.relativeDir,
+          repo_root: ctx.repoRoot,
+          model: ctx.model
         }
       };
     }
